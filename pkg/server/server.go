@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -352,6 +353,10 @@ func (s *Server) installControllers(ctx context.Context, controllerConfig *rest.
 func (s *Server) Run(ctx context.Context) error {
 	logger := klog.FromContext(ctx).WithValues("component", "kcp")
 	ctx = klog.NewContext(ctx, logger)
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	if err := s.AddPostStartHook("kcp-bootstrap-policy", bootstrappolicy.Policy().EnsureRBACPolicy()); err != nil {
 		return err

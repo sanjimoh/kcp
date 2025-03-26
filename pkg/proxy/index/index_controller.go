@@ -37,8 +37,8 @@ import (
 	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
 	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
 	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 	corev1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/core/v1alpha1"
-	tenancyv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/tenancy/v1alpha1"
 	corev1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/core/v1alpha1"
 )
 
@@ -76,35 +76,38 @@ func NewController(
 
 		shardWorkspaceInformers:      map[string]cache.SharedIndexInformer{},
 		shardLogicalClusterInformers: map[string]cache.SharedIndexInformer{},
-		shardWorkspaceStopCh:         map[string]chan struct{}{},
+		shardWorkspaceStopCh:         make(map[string]chan struct{}),
+		shardLogicalClusterStopCh:    make(map[string]chan struct{}),
+		shardEventHandlers:           map[string]cache.ResourceEventHandlerRegistration{},
 
 		state: *index.New([]index.PathRewriter{
 			indexrewriters.UserRewriter,
 		}),
 	}
 
+	// Create a shared informer factory for the client
+	client, err := clientGetter(nil)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return c
+	}
+	c.sharedInformerFactory = informers.NewSharedInformerFactory(client, resyncPeriod)
+
 	_, _ = shardInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			shard := obj.(*corev1alpha1.Shard)
-			c.state.UpsertShard(shard.Name, shard.Spec.BaseURL)
-			c.enqueueShard(ctx, shard)
+			c.queue.Add(shard.Name)
 		},
 		UpdateFunc: func(old, obj interface{}) {
 			shard := obj.(*corev1alpha1.Shard)
-			oldShard := old.(*corev1alpha1.Shard)
-			if oldShard.Spec.BaseURL == shard.Spec.BaseURL {
-				return
-			}
-			c.stopShard(oldShard.Name)
-			c.enqueueShard(ctx, shard)
+			c.queue.Add(shard.Name)
 		},
 		DeleteFunc: func(obj interface{}) {
 			if final, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 				obj = final.Obj
 			}
 			shard := obj.(*corev1alpha1.Shard)
-
-			c.stopShard(shard.Name)
+			c.queue.Add(shard.Name)
 		},
 	})
 
@@ -126,6 +129,11 @@ type Controller struct {
 	shardWorkspaceInformers      map[string]cache.SharedIndexInformer
 	shardLogicalClusterInformers map[string]cache.SharedIndexInformer
 	shardWorkspaceStopCh         map[string]chan struct{}
+	shardLogicalClusterStopCh    map[string]chan struct{}
+	shardEventHandlers           map[string]cache.ResourceEventHandlerRegistration
+
+	// Add shared informer factory
+	sharedInformerFactory informers.SharedInformerFactory
 
 	state index.State
 }
@@ -137,7 +145,11 @@ func (c *Controller) Start(ctx context.Context, numThreads int) {
 	defer func() {
 		c.lock.Lock()
 		defer c.lock.Unlock()
+		// Clean up all stop channels
 		for _, stopCh := range c.shardWorkspaceStopCh {
+			close(stopCh)
+		}
+		for _, stopCh := range c.shardLogicalClusterStopCh {
 			close(stopCh)
 		}
 	}()
@@ -225,8 +237,14 @@ func (c *Controller) process(ctx context.Context, key string) error {
 			return err
 		}
 
-		wsInformer := tenancyv1alpha1informers.NewWorkspaceClusterInformer(client, resyncPeriod, nil)
-		_, _ = wsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// Create a single shared informer factory for this shard
+		shardInformerFactory := informers.NewSharedInformerFactory(client, resyncPeriod)
+
+		// Get informers from the factory
+		wsInformer := shardInformerFactory.Tenancy().V1alpha1().Workspaces().Informer()
+		twInformer := shardInformerFactory.Core().V1alpha1().LogicalClusters().Informer()
+
+		handler, err := wsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				ws := obj.(*tenancyv1alpha1.Workspace)
 				c.state.UpsertWorkspace(shard.Name, ws)
@@ -243,8 +261,11 @@ func (c *Controller) process(ctx context.Context, key string) error {
 				c.state.DeleteWorkspace(shard.Name, ws)
 			},
 		})
+		if err != nil {
+			return err
+		}
+		c.shardEventHandlers[shard.Name] = handler
 
-		twInformer := corev1alpha1informers.NewLogicalClusterClusterInformer(client, resyncPeriod, nil)
 		_, _ = twInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				logicalCluster := obj.(*corev1alpha1.LogicalCluster)
@@ -263,32 +284,46 @@ func (c *Controller) process(ctx context.Context, key string) error {
 			},
 		})
 
-		stopCh := make(chan struct{})
+		// Store informers and start them
 		c.shardWorkspaceInformers[shard.Name] = wsInformer
 		c.shardLogicalClusterInformers[shard.Name] = twInformer
-		c.shardWorkspaceStopCh[shard.Name] = stopCh
 
-		go wsInformer.Run(stopCh)
-		go twInformer.Run(stopCh)
-
-		// no need to wait. We only care about events and they arrive when they arrive.
+		// Start the informer factory with context cancellation
+		shardInformerFactory.Start(ctx.Done())
 	}
 
 	return nil
 }
 
-func (c *Controller) stopShard(shardName string) {
-	c.state.DeleteShard(shardName)
-
+func (c *Controller) stopShard(shard string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if stopCh, found := c.shardWorkspaceStopCh[shardName]; found {
-		close(stopCh)
+	// Clean up workspace informer and its event handlers
+	if wsInformer, found := c.shardWorkspaceInformers[shard]; found {
+		if handler, found := c.shardEventHandlers[shard]; found {
+			wsInformer.RemoveEventHandler(handler)
+			delete(c.shardEventHandlers, shard)
+		}
+		delete(c.shardWorkspaceInformers, shard)
 	}
-	delete(c.shardWorkspaceStopCh, shardName)
-	delete(c.shardWorkspaceInformers, shardName)
-	delete(c.shardLogicalClusterInformers, shardName)
+
+	// Clean up logical cluster informer
+	if lcInformer, found := c.shardLogicalClusterInformers[shard]; found {
+		// Stop the informer to ensure all processor listeners are cleaned up
+		lcInformer.GetController().Run(nil)
+		delete(c.shardLogicalClusterInformers, shard)
+	}
+
+	// Clean up stop channels if they exist
+	if stopCh, found := c.shardWorkspaceStopCh[shard]; found {
+		close(stopCh)
+		delete(c.shardWorkspaceStopCh, shard)
+	}
+	if stopCh, found := c.shardLogicalClusterStopCh[shard]; found {
+		close(stopCh)
+		delete(c.shardLogicalClusterStopCh, shard)
+	}
 }
 
 func (c *Controller) LookupURL(path logicalcluster.Path) (index.Result, bool) {
