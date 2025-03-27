@@ -305,13 +305,19 @@ func (c *Controller) stopShard(shard string) {
 			wsInformer.RemoveEventHandler(handler)
 			delete(c.shardEventHandlers, shard)
 		}
+		// Stop the informer to ensure all processor listeners are cleaned up
+		if controller := wsInformer.GetController(); controller != nil {
+			controller.Run(nil)
+		}
 		delete(c.shardWorkspaceInformers, shard)
 	}
 
 	// Clean up logical cluster informer
 	if lcInformer, found := c.shardLogicalClusterInformers[shard]; found {
 		// Stop the informer to ensure all processor listeners are cleaned up
-		lcInformer.GetController().Run(nil)
+		if controller := lcInformer.GetController(); controller != nil {
+			controller.Run(nil)
+		}
 		delete(c.shardLogicalClusterInformers, shard)
 	}
 

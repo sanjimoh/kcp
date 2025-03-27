@@ -102,6 +102,22 @@ func NewController(
 		logicalClusterLister:              logicalClusterInformer.Lister(),
 		deleter:                           deletion.NewWorkspacedResourcesDeleter(metadataClusterClient, discoverResourcesFn, isBoundResource),
 		commit:                            committer.NewCommitter[*LogicalCluster, Patcher, *LogicalClusterSpec, *LogicalClusterStatus](kcpClusterClient.CoreV1alpha1().LogicalClusters()),
+		informerCleanup: func(ctx context.Context, logicalCluster *corev1alpha1.LogicalCluster) error {
+			// Get all informers associated with this logical cluster
+			informers := []cache.SharedIndexInformer{
+				// Add all relevant informers here
+				logicalClusterInformer.Informer(),
+				// Add other informers as needed
+			}
+
+			// Stop all informers
+			for _, informer := range informers {
+				if controller := informer.GetController(); controller != nil {
+					controller.Run(nil)
+				}
+			}
+			return nil
+		},
 	}
 
 	_, _ = logicalClusterInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
@@ -146,6 +162,8 @@ type Controller struct {
 	deleter deletion.WorkspaceResourcesDeleterInterface
 
 	commit CommitFunc
+
+	informerCleanup func(ctx context.Context, logicalCluster *corev1alpha1.LogicalCluster) error
 }
 
 func (c *Controller) enqueue(obj interface{}) {
@@ -259,6 +277,13 @@ func (c *Controller) process(ctx context.Context, key string) error {
 
 	logger.V(2).Info("deleting logical cluster")
 	startTime := time.Now()
+
+	// Clean up informers before deletion
+	if err := c.informerCleanup(ctx, logicalClusterCopy); err != nil {
+		logger.Error(err, "failed to cleanup informers")
+		return fmt.Errorf("failed to cleanup informers: %w", err)
+	}
+
 	deleteErr = c.deleter.Delete(ctx, logicalClusterCopy)
 	if deleteErr == nil {
 		logger.V(4).Info("finished deleting logical cluster content", "duration", time.Since(startTime))

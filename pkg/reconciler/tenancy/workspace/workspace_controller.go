@@ -89,6 +89,24 @@ func NewController(
 		logicalClusterLister:  logicalClusterInformer.Lister(),
 
 		commit: committer.NewCommitter[*tenancyv1alpha1.Workspace, tenancyv1alpha1client.WorkspaceInterface, *tenancyv1alpha1.WorkspaceSpec, *tenancyv1alpha1.WorkspaceStatus](kcpClusterClient.TenancyV1alpha1().Workspaces()),
+
+		informerCleanup: func(ctx context.Context, key string) error {
+			// Get all informers associated with this workspace
+			informers := []cache.SharedIndexInformer{
+				// Add all relevant informers here
+				workspaceInformer.Informer(),
+				logicalClusterInformer.Informer(),
+				// Add other informers as needed
+			}
+
+			// Stop all informers
+			for _, informer := range informers {
+				if controller := informer.GetController(); controller != nil {
+					controller.Run(nil)
+				}
+			}
+			return nil
+		},
 	}
 
 	_, _ = workspaceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -134,6 +152,8 @@ type Controller struct {
 
 	// commit creates a patch and submits it, if needed.
 	commit func(ctx context.Context, old, new *workspaceResource) error
+
+	informerCleanup func(ctx context.Context, key string) error
 }
 
 func (c *Controller) enqueue(obj interface{}) {
@@ -247,6 +267,10 @@ func (c *Controller) process(ctx context.Context, key string) (bool, error) {
 	workspace, err := c.workspaceLister.Cluster(parent).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// Clean up informers when workspace is deleted
+			if err := c.informerCleanup(ctx, key); err != nil {
+				return false, fmt.Errorf("failed to cleanup workspace informers: %w", err)
+			}
 			return false, nil // object deleted before we handled it
 		}
 		return false, err
